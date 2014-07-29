@@ -1,13 +1,14 @@
 #! /bin/sh
 
 default_sink_file=/tmp/audiofrk_default_sink
-channels=2
+channels=1
 
 print_usage() {
-  echo "usage: ${0} (server|client|stop)"
-  echo "       ${0} server [host[:port]]"   
-  echo "       ${0} client [default-sink] [testsrc] host[:port] [host:[[port]] ..."   
-  echo "       ${0} stop"   
+  echo "usage: ${0} (server|client|stop|refresh)"
+  echo "       ${0} server [host[:port]]"
+  echo "       ${0} client [default-sink] [testsrc] host[:port] [host:[[port]] ..."
+  echo "       ${0} refresh"
+  echo "       ${0} stop"
 }
 
 get_host() {
@@ -30,8 +31,9 @@ get_or_create_null_sink() {
   new_sink="$(pacmd list-sinks \
         | grep null_sink -B 1 \
         | grep index | cut -f2 -d: | tr -d ' ')"
-  if [ -z "${new_sink}" ] ; then 
+  if [ -z "${new_sink}" ] ; then
     pactl load-module module-null-sink sink_name=null_sink >/dev/null
+    sleep 1
     new_sink="$(pacmd list-sinks \
           | grep null_sink -B 1 \
           | grep index | cut -f2 -d: | tr -d ' ')"
@@ -58,16 +60,33 @@ connect() {
     src='pulsesrc device="null_sink.monitor"'
   fi
 
-  gst-launch-0.10 ${src} ! \
-    queue max-size-time=100000000 ! \
-    audio/x-raw-int, endianness="(int)1234", \
-      signed="(boolean)true", width="(int)16", \
-      depth="(int)16", rate="(int)22000", channels="(int)${channels}" ! \
-    audioconvert ! \
-    vorbisenc ! \
-    oggmux max-delay=50 max-page-delay=50 ! \
-    multiudpsink clients="${clients}" || (
-  echo "Connection closed: ${clients}")
+  (
+    while true; do
+      gst-launch-0.10 ${src} \
+        ! queue max-size-time=100000000 \
+        ! audioconvert \
+        ! audio/x-raw-int,channels=${channels},depth=16,width=16,rate=44100 \
+        ! rtpL16pay \
+        ! multiudpsink clients="${clients}" || (
+        echo "Connection closed: ${clients}")
+      done
+  ) &
+}
+
+get_default_sink() {
+  orig_sink=$(pacmd stat | grep -i "Default sink name:" | cut -f4- -d\ )
+  if [ -z "${orig_sink}" ] || [ "${orig_sink}" = 'null_sink' ] ; then
+    orig_sink="$(pacmd list-sinks | grep name: | cut -d\< -f2 | cut -d\> -f1 | head -n1)"
+  fi
+  if ( [ -z "${orig_sink}" ] || [ "${orig_sink}" != 'null_sink' ] ) && \
+    [ -e "${default_sink_file}" ] ; then
+    cat "${default_sink_file}"
+    return
+  fi
+  if [ -n "${orig_sink}" ] && [ "${orig_sink}" != 'null_sink' ] ; then
+    echo "${orig_sink}" > "${default_sink_file}"
+    echo "${orig_sink}"
+  fi
 }
 
 run_client() {
@@ -76,14 +95,7 @@ run_client() {
   ## 3. execute bash given by $@
   # 4. when done, replace default audio again
   new_sink=$(get_or_create_null_sink)
-  orig_sink=$(pacmd stat | grep -i "Default sink name:" | cut -f4- -d\ )
-  if [ -z "${orig_sink}" ] || [ "${orig_sink}" = 'null_sink' ] ; then
-    orig_sink="$(pacmd list-sinks | grep name: | cut -d\< -f2 | cut -d\> -f1 | head -n1)"
-  fi
-  if [ -n "${orig_sink}" ] && [ "${orig_sink}" != 'null_sink' ] ; then
-    echo "${orig_sink}" > "${default_sink_file}"
-  fi
-  
+  orig_sink=$(get_default_sink)
 
   if [ "${1}" = 'default-sink' ] ; then
     shift
@@ -101,9 +113,6 @@ run_client() {
   while [ $# -gt 0 ] ; do
     host=$(get_host ${1})
     port=$(get_port ${1})
-    ctrl_port=$((${port} + 1))
-    # kill gstreamer to reset ogg stream
-    echo 'restart' | nc -q1 -w1 "${host}" "${ctrl_port}"
     if [ -n "${client}" ] ; then
       client="${client},${host}:${port}"
     else
@@ -114,11 +123,8 @@ run_client() {
   if [ -z "${client}" ] ; then
     echo "whoop? no server to connect to"
   else
-    # let server resettle
-    # esp, raspberries need some time to restart gstreamer
-    sleep 10
-    ( connect ${client} ${testsrc} )&
-    if [ ${default_sink} -eq 1 ] ; then 
+    connect ${client} ${testsrc}
+    if [ ${default_sink} -eq 1 ] ; then
       sleep 1
       pactl set-default-sink ${new_sink}
     fi
@@ -138,48 +144,33 @@ run_server() {
     listen_args="port=${port}"
   fi
 
-  ctrl_port=$((${port} + 1))
-  (
-    if [ -n "${host}" ] ; then
-      ctrl_host_port=${ctrl_port}
-      nc_args=${ctrl_port}
-    else
-      ctrl_host_port=${host}:${ctrl_port}
-      nc_args="${host} ${ctrl_port}"
-    fi
-
-    echo "opening control port: ${ctrl_host_port}"
-    while true ; do
-      cmd="$(nc -l ${nc_args})"
-      echo "request: ${cmd}"
-      pkill -fu "$(id -u)" 'gst-launch-0.10 udpsrc'
-    done
-  ) &
-  
   echo "starting gstreamer server on ${host}:${port}"
   while true ; do
     echo "restarting gstreamer server"
     gst-launch-0.10 udpsrc ${listen_args} \
       ! queue max-size-time=100000000 \
-      ! oggdemux \
-      ! vorbisdec \
+      ! "application/x-rtp,media=audio,
+         clock-rate=44100,
+         width=16,
+         height=16,
+         encoding-name=L16,
+         encoding-params=1,
+         channels=${channels},
+         channel-positions=1,
+         payload=96" \
+      ! rtpL16depay \
       ! audioconvert \
-      ! audio/x-raw-int, endianness="(int)1234", \
-        signed="(boolean)true", width="(int)16", \
-        depth="(int)16", rate="(int)22000", channels="(int)${channels}" \
       ! alsasink sync=false
   done
 }
 
 kill_audiofrk() {
-  if [ -f "${default_sink_file}" ] ; then
-    orig_sink=$(cat "${default_sink_file}")
-    if [ -n "${orig_sink}" ] ; then
-      echo "switch back default sink: ${orig_sink}"
-      pactl set-default-sink ${orig_sink}
-    fi
-    rm "${default_sink_file}"
+  orig_sink=$(get_default_sink)
+  if [ -n "${orig_sink}" ] ; then
+    echo "switch back default sink: ${orig_sink}"
+    pactl set-default-sink ${orig_sink}
   fi
+  rm "${default_sink_file}"
 
   client_pids="$(pgrep -fu $(id -u) 'gst-launch-0.10 pulsesrc') $(pgrep -fu $(id -u) 'gst-launch-0.10 audiotestsrc')"
   if [ -n "${client_pids}" ] && [ "${client_pids}" != " " ] ; then
@@ -189,8 +180,8 @@ kill_audiofrk() {
     done
   fi
 
-  server_pids="$(pgrep -xu $(id -u) audiofrk) $(pgrep -fu $(id -u) 'nc -l')"
-  if [ -n "${server_pids}" ] && [ "${server_pids}" != " " ] ; then
+  server_pids="$(pgrep -xu $(id -u) audiofrk)"
+  if [ -n "${server_pids}" ]; then
     for pid in ${server_pids} ; do
       if [ $pid -eq $$ ] ; then
         continue
@@ -201,6 +192,27 @@ kill_audiofrk() {
   fi
 
   unload_null_sink
+}
+
+move_all_to_default() {
+  default_sink=$1
+  current_sink=$2
+  pactl list sink-inputs short | while read line ; do
+    eval $(echo "${line}" | awk '{print "export input="$1" ; export sink="$2" ;" }')
+    if [ -z "${current_sink}" ] || [ "${sink}" = "${current_sink}" ] ; then
+      echo "moving sink input (${input}) to default (${default_sink})"
+      pactl move-sink-input ${input} ${default_sink}
+    fi
+  done
+}
+
+refresh_gst() {
+  orig_sink=$(get_default_sink)
+  if [ -n "${orig_sink}" ] ; then
+    move_all_to_default "${orig_sink}"
+    sleep 1
+  fi
+  pkill -xu $(id -u) gst-launch-0.10
 }
 
 if [ $# -lt 1 ] ; then
@@ -220,6 +232,9 @@ case "${action}" in
     ;;
   stop)
     kill_audiofrk
+    ;;
+  refresh)
+    refresh_gst
     ;;
   *)
     print_usage

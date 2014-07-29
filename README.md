@@ -41,8 +41,3 @@ The following packages are necessary on Ubuntu/debian.
 gstreamer code comes mostly from [http://stackoverflow.com/a/15570501/2331953](here)
 
 Initial idea and pulse code comes from [https://github.com/adgaudio/raspberry_pi_mopidy/blob/master/gstreamer.sh](here)
-
-# Known bugs
-
-The server is unable to play the audio stream if it misses the beginning.
-Therefore the client kills any gstreamer instance on any server it tries to connect to.
