@@ -1,6 +1,7 @@
 #! /bin/sh
 
 default_sink_file=/tmp/audiofrk_default_sink
+channels=2
 
 print_usage() {
   echo "usage: ${0} (server|client|stop)"
@@ -52,6 +53,7 @@ connect() {
   clients=${1}
   if [ "${2}" = 'testsrc' ] ; then
     src='audiotestsrc'
+    shift
   else
     src='pulsesrc device="null_sink.monitor"'
   fi
@@ -60,7 +62,7 @@ connect() {
     queue max-size-time=100000000 ! \
     audio/x-raw-int, endianness="(int)1234", \
       signed="(boolean)true", width="(int)16", \
-      depth="(int)16", rate="(int)22000", channels="(int)1" ! \
+      depth="(int)16", rate="(int)22000", channels="(int)${channels}" ! \
     audioconvert ! \
     vorbisenc ! \
     oggmux max-delay=50 max-page-delay=50 ! \
@@ -90,7 +92,7 @@ run_client() {
     default_sink=0
   fi
 
-  if [ "${1}" = 'test' ] ; then
+  if [ "${1}" = 'testsrc' ] ; then
     shift
     testsrc=testsrc
   fi
@@ -99,8 +101,9 @@ run_client() {
   while [ $# -gt 0 ] ; do
     host=$(get_host ${1})
     port=$(get_port ${1})
+    ctrl_port=$((${port} + 1))
     # kill gstreamer to reset ogg stream
-    ssh "${host}" pkill -f "'gst-launch-0.10 udpsrc'"
+    echo 'restart' | nc -q1 -w1 "${host}" "${ctrl_port}"
     if [ -n "${client}" ] ; then
       client="${client},${host}:${port}"
     else
@@ -112,7 +115,8 @@ run_client() {
     echo "whoop? no server to connect to"
   else
     # let server resettle
-    sleep 1
+    # esp, raspberries need some time to restart gstreamer
+    sleep 10
     ( connect ${client} ${testsrc} )&
     if [ ${default_sink} -eq 1 ] ; then 
       sleep 1
@@ -129,19 +133,32 @@ run_server() {
   port=$(get_port ${1})
 
   if [ -n "${host}" ] ; then
-    listen_args="host=${host}"
+    listen_args="host=${host} port=${port}"
   else
-    listenargs=""
+    listen_args="port=${port}"
   fi
-  if [ -n "${port}" ] ; then
-    listen_args="${listen_args} port=${port}"
-  else
-    listen_args="${listen_args} port=3000"
-  fi
+
+  ctrl_port=$((${port} + 1))
+  (
+    if [ -n "${host}" ] ; then
+      ctrl_host_port=${ctrl_port}
+      nc_args=${ctrl_port}
+    else
+      ctrl_host_port=${host}:${ctrl_port}
+      nc_args="${host} ${ctrl_port}"
+    fi
+
+    echo "opening control port: ${ctrl_host_port}"
+    while true ; do
+      cmd="$(nc -l ${nc_args})"
+      echo "request: ${cmd}"
+      pkill -fu "$(id -u)" 'gst-launch-0.10 udpsrc'
+    done
+  ) &
   
   echo "starting gstreamer server on ${host}:${port}"
   while true ; do
-    echo "resarting gstreamer server"
+    echo "restarting gstreamer server"
     gst-launch-0.10 udpsrc ${listen_args} \
       ! queue max-size-time=100000000 \
       ! oggdemux \
@@ -149,7 +166,7 @@ run_server() {
       ! audioconvert \
       ! audio/x-raw-int, endianness="(int)1234", \
         signed="(boolean)true", width="(int)16", \
-        depth="(int)16", rate="(int)22000", channels="(int)1" \
+        depth="(int)16", rate="(int)22000", channels="(int)${channels}" \
       ! alsasink sync=false
   done
 }
@@ -164,16 +181,16 @@ kill_audiofrk() {
     rm "${default_sink_file}"
   fi
 
-  client_pids=$(pgrep -f "gst-launch-0.10 pulsesrc")
-  if [ -n "${client_pids}" ] ; then
+  client_pids="$(pgrep -fu $(id -u) 'gst-launch-0.10 pulsesrc') $(pgrep -fu $(id -u) 'gst-launch-0.10 audiotestsrc')"
+  if [ -n "${client_pids}" ] && [ "${client_pids}" != " " ] ; then
     echo "killing client: ${client_pids}"
     for pid in ${client_pids} ; do
       kill ${pid}
     done
   fi
 
-  server_pids=$(pgrep -x audiofrk)
-  if [ -n "${server_pids}" ] ; then
+  server_pids="$(pgrep -xu $(id -u) audiofrk) $(pgrep -fu $(id -u) 'nc -l')"
+  if [ -n "${server_pids}" ] && [ "${server_pids}" != " " ] ; then
     for pid in ${server_pids} ; do
       if [ $pid -eq $$ ] ; then
         continue
